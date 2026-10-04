@@ -4,7 +4,7 @@ Aura 2026 is an AI-powered personalized goal architect, study companion, and pro
 
 ---
 
-### **Live Demo:** [Live Demo link]()
+### **Live Demo:** [Live Demo link](https://aura-2026-a5brye7uysowjzmfrehbkm.streamlit.app/)
 
 ## Features
 
