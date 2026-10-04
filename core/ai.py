@@ -14,43 +14,60 @@ class AIError(Exception):
 
 
 _CLIENT = None
+_CLIENT_KEY = None
 
 
 def _get_client():
-    global _CLIENT
-    if not config.GROQ_API_KEY:
-        raise AIError("No GROQ_API_KEY found. Add it to your .env file and restart the app.")
-    if _CLIENT is None:
+    global _CLIENT, _CLIENT_KEY
+    api_key = getattr(config, "GROQ_API_KEY", None)
+    if not api_key:
+        raise AIError("No GROQ_API_KEY found. Check your configuration or Streamlit Secrets.")
+    
+    # Re-initialize client if key changes or client doesn't exist
+    if _CLIENT is None or _CLIENT_KEY != api_key:
         from groq import Groq
-        _CLIENT = Groq(api_key=config.GROQ_API_KEY)
+        _CLIENT = Groq(api_key=api_key)
+        _CLIENT_KEY = api_key
     return _CLIENT
 
 
 def _friendly_error(exc: Exception) -> str:
-    import groq
-    if isinstance(exc, groq.AuthenticationError):
-        return "The Groq API key was rejected. Check GROQ_API_KEY in your .env file."
-    if isinstance(exc, groq.RateLimitError):
-        return "The AI is busy (rate limit reached). Please wait a minute and try again."
-    if isinstance(exc, groq.APIConnectionError):
-        return "Could not reach the AI service. Check your internet connection."
-    return "The AI service had a problem. Please try again in a moment."
+    try:
+        import groq
+        if isinstance(exc, groq.AuthenticationError):
+            return "The Groq API key was rejected. Check GROQ_API_KEY in your secrets/settings."
+        if isinstance(exc, groq.RateLimitError):
+            return "The AI is busy (rate limit reached). Please wait a minute and try again."
+        if isinstance(exc, groq.APIConnectionError):
+            return "Could not reach the AI service. Check your internet connection."
+        if isinstance(exc, groq.NotFoundError):
+            return f"Model not found on Groq. Check GROQ_MODEL setting. Details: {exc}"
+        if isinstance(exc, groq.BadRequestError):
+            return f"Bad request to Groq API: {exc}"
+    except ImportError:
+        pass
+    return f"The AI service encountered an issue: {str(exc)}"
 
 
 def _complete(messages, temperature=0.7, json_mode=False, max_tokens=2500) -> str:
     """The ONE function that calls the AI. Tests replace this with a fake."""
     client = _get_client()
+    model = getattr(config, "GROQ_MODEL", "llama-3.3-70b-versatile")
     kwargs = {
-        "model": config.GROQ_MODEL, "messages": messages,
-        "temperature": temperature, "max_tokens": max_tokens,
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
     }
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
+    
     try:
         response = client.chat.completions.create(**kwargs)
-    except Exception as exc:  # noqa: BLE001 - we convert every failure to AIError
+    except Exception as exc:  # noqa: BLE001 - convert failures to AIError
         raise AIError(_friendly_error(exc)) from exc
-    content = response.choices[0].message.content
+    
+    content = response.choices[0].message.content if response.choices else None
     if not content or not content.strip():
         raise AIError("The AI sent an empty answer. Please try again.")
     return content
@@ -61,14 +78,23 @@ def extract_json(text: str):
     """Find the first JSON object inside text (handles ```json fences). None if broken."""
     if not text:
         return None
-    text = re.sub(r"```(?:json)?", "", text)
+    # Strip markdown code block wrappers
+    text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE)
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
         return None
+    
+    json_str = text[start : end + 1]
     try:
-        data = json.loads(text[start:end + 1])
+        data = json.loads(json_str, strict=False)
     except json.JSONDecodeError:
-        return None
+        try:
+            # Fallback: scrub raw control characters and retry
+            cleaned = re.sub(r"[\x00-\x1F\x7F]", " ", json_str)
+            data = json.loads(cleaned, strict=False)
+        except json.JSONDecodeError:
+            return None
+            
     return data if isinstance(data, dict) else None
 
 
@@ -119,7 +145,9 @@ def clean_quiz(raw, limit: int = 10):
             continue
         explanation = item.get("explanation")
         questions.append({
-            "question": question.strip()[:500], "options": options, "answer_index": answer,
+            "question": question.strip()[:500],
+            "options": options,
+            "answer_index": answer,
             "explanation": explanation.strip()[:600] if isinstance(explanation, str) else "",
         })
     return questions[:limit]
@@ -145,6 +173,7 @@ def clean_resources(raw, limit: int = 6):
 
 # ----------------------------------------------------------------- prompts
 def _profile_line(profile: dict) -> str:
+    profile = profile or {}
     deadline = profile.get("deadline")
     return (
         f"level={profile.get('level', 'Beginner')}; "
@@ -155,7 +184,7 @@ def _profile_line(profile: dict) -> str:
 
 
 def _language(profile: dict) -> str:
-    return profile.get("language") or "English"
+    return (profile or {}).get("language") or "English"
 
 
 _ARCHITECT_PROMPT = """You are Aura, a warm, practical learning coach who helps ANY learner \
@@ -182,22 +211,34 @@ Write everything the learner reads in {language}. Keep the JSON keys in English.
 
 def architect_reply(history, profile: dict, mood: str = "Neutral") -> dict:
     """history = list of {"role","content"}. Returns {"text","title","tasks","json_error"}."""
+    profile = profile or {}
     system = _ARCHITECT_PROMPT.format(
-        profile=_profile_line(profile), intensity=profile.get("intensity", "Balanced"),
-        mood=mood, language=_language(profile))
+        profile=_profile_line(profile),
+        intensity=profile.get("intensity", "Balanced"),
+        mood=mood,
+        language=_language(profile),
+    )
     raw = _complete([{"role": "system", "content": system}] + list(history), temperature=0.7)
     return parse_architect_output(raw)
 
 
 def parse_architect_output(raw: str) -> dict:
-    marker = "---JSON---"
-    if marker not in raw:
+    pattern = re.compile(r"---JSON---(.*?)---END---", re.DOTALL | re.IGNORECASE)
+    match = pattern.search(raw)
+    
+    if match:
+        text = raw[:match.start()]
+        block = match.group(1)
+        data = extract_json(block)
+    elif "---JSON---" in raw:
+        text, _, block = raw.partition("---JSON---")
+        data = extract_json(block)
+    else:
         return {"text": raw.strip(), "title": "", "tasks": [], "json_error": False}
-    text, _, rest = raw.partition(marker)
-    block = rest.split("---END---")[0]
-    data = extract_json(block)
-    tasks = clean_tasks(data.get("tasks")) if data else []
-    title = data.get("title") if data else ""
+
+    data = data if isinstance(data, dict) else {}
+    tasks = clean_tasks(data.get("tasks"))
+    title = data.get("title")
     title = " ".join(title.split())[:120] if isinstance(title, str) else ""
     return {"text": text.strip(), "title": title, "tasks": tasks, "json_error": not tasks}
 
@@ -215,6 +256,7 @@ def coach_answer(goal_title: str, roadmap_text: str, question: str, profile: dic
 
 def simplify_tasks(task_texts, reason: str, profile: dict):
     """Rewrite tasks smaller. Returns a clean list of strings (raises AIError if unusable)."""
+    profile = profile or {}
     system = (
         "You shrink study tasks so a tired or busy learner can still make progress. Keep the same "
         "overall direction, but make every task smaller and more concrete. Return ONLY JSON like "
@@ -223,9 +265,11 @@ def simplify_tasks(task_texts, reason: str, profile: dict):
     )
     user = (f"Reason: {reason}. Learner time per day: {profile.get('daily_minutes', 30)} minutes.\n"
             f"Current tasks: {json.dumps(list(task_texts), ensure_ascii=False)}")
+    
     data = extract_json(_complete(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.4, json_mode=True))
+    
     tasks = clean_tasks(data.get("tasks")) if data else []
     if not tasks:
         raise AIError("The AI could not rewrite the tasks this time. Please try again.")
@@ -233,6 +277,7 @@ def simplify_tasks(task_texts, reason: str, profile: dict):
 
 
 def make_flashcards(task: str, goal: str, profile: dict, n: int = 8):
+    profile = profile or {}
     system = (
         "You write flashcards for active recall. Each card tests ONE idea with a short question "
         "(front) and a short, correct answer (back). Return ONLY JSON like "
@@ -240,9 +285,11 @@ def make_flashcards(task: str, goal: str, profile: dict, n: int = 8):
         f"Write in {_language(profile)}. Only include facts you are confident are correct."
     )
     user = f"Overall goal: {goal}\nTask: {task}\nLevel: {profile.get('level')}\nMake {n} cards."
+    
     data = extract_json(_complete(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.4, json_mode=True))
+    
     cards = clean_cards(data.get("cards")) if data else []
     if not cards:
         raise AIError("The AI could not make usable flashcards this time. Please try again.")
@@ -250,6 +297,7 @@ def make_flashcards(task: str, goal: str, profile: dict, n: int = 8):
 
 
 def make_quiz(task: str, goal: str, profile: dict, n: int = 5):
+    profile = profile or {}
     system = (
         "You write multiple-choice quizzes. Each question has exactly 4 different options, one "
         "correct. Return ONLY JSON like "
@@ -259,9 +307,11 @@ def make_quiz(task: str, goal: str, profile: dict, n: int = 5):
         "Only ask things you are confident about."
     )
     user = f"Overall goal: {goal}\nTask: {task}\nMake {n} questions."
+    
     data = extract_json(_complete(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.4, json_mode=True))
+    
     questions = clean_quiz(data.get("questions")) if data else []
     if not questions:
         raise AIError("The AI could not make a usable quiz this time. Please try again.")
@@ -269,6 +319,7 @@ def make_quiz(task: str, goal: str, profile: dict, n: int = 5):
 
 
 def suggest_resources(task: str, goal: str, profile: dict):
+    profile = profile or {}
     system = (
         "You suggest READING-FIRST learning resources (books, official documentation, articles, "
         "practice sets). You cannot browse, so do NOT give URLs. Give well-known titles you are "
@@ -278,9 +329,11 @@ def suggest_resources(task: str, goal: str, profile: dict):
         f"Write in {_language(profile)}."
     )
     user = f"Overall goal: {goal}\nTask: {task}\nLearner level: {profile.get('level')}"
+    
     data = extract_json(_complete(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.4, json_mode=True))
+    
     items = clean_resources(data.get("resources")) if data else []
     if not items:
         raise AIError("The AI could not suggest resources this time. Please try again.")
@@ -294,15 +347,20 @@ def weekly_summary(stats: dict, goal_title: str, tasks_done: int, tasks_total: i
         "observation, and two specific suggestions for next week. Use ONLY the numbers given; never "
         f"invent data. Write in {_language(profile)}."
     )
-    facts = {**stats, "goal": goal_title, "tasks_done": tasks_done,
-             "tasks_total": tasks_total, "current_streak_days": streak}
+    facts = {
+        **(stats or {}),
+        "goal": goal_title,
+        "tasks_done": tasks_done,
+        "tasks_total": tasks_total,
+        "current_streak_days": streak,
+    }
     return _complete([{"role": "system", "content": system},
                       {"role": "user", "content": json.dumps(facts, ensure_ascii=False)}],
                      temperature=0.5, max_tokens=600)
 
 
 def answer_from_notes(question: str, excerpts, profile: dict) -> str:
-    numbered = "\n\n".join(f"[{i}] ({e['filename']}) {e['text']}" for i, e in enumerate(excerpts, 1))
+    numbered = "\n\n".join(f"[{i}] ({e.get('filename', 'note')}) {e.get('text', '')}" for i, e in enumerate(excerpts or [], 1))
     system = (
         "Answer the question using ONLY the excerpts from the learner's own notes. If the excerpts "
         "do not contain the answer, say clearly that the notes do not cover it. Mention which "
