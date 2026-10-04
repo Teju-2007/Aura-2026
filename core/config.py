@@ -3,35 +3,74 @@
 Other files import from this file, so you change a value in ONE place only.
 """
 import os
-
+import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()  # reads the ".env" file (if it exists) into environment variables
+load_dotenv()  # reads local ".env" file if present
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 
+def _get_secret(key: str, default: str = "") -> str:
+    """Safely retrieves a configuration value from Streamlit Secrets first,
+    falling back to environment variables (.env), and finally to a default value.
+    """
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            val = st.secrets[key]
+            if val is not None:
+                return str(val)
+    except Exception:
+        pass
+    val = os.getenv(key)
+    if val is not None:
+        return str(val)
+    return default
+
+
+# --- API KEYS & MODELS ---
+GROQ_API_KEY = _get_secret("GROQ_API_KEY").strip()
+GROQ_MODEL = _get_secret("GROQ_MODEL", "openai/gpt-oss-120b").strip()
+
+
+# --- DATABASE CONFIGURATION ---
 def _fix_db_url(url: str) -> str:
     """Hosting sites often give 'postgres://...'; SQLAlchemy wants a driver name."""
     if url.startswith("postgres://"):
-        return "postgresql+psycopg2://" + url[len("postgres://"):]
+        return "postgresql+psycopg2://" + url[len("postgres://") :]
     if url.startswith("postgresql://"):
-        return "postgresql+psycopg2://" + url[len("postgresql://"):]
+        return "postgresql+psycopg2://" + url[len("postgresql://") :]
     return url
 
 
-DATABASE_URL = _fix_db_url(os.getenv("DATABASE_URL", "sqlite:///aura.db").strip())
+raw_db_url = _get_secret("DATABASE_URL", "sqlite:///aura.db").strip()
+DATABASE_URL = _fix_db_url(raw_db_url)
 
-SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587") or 587)
-SMTP_USER = os.getenv("SMTP_USER", "").strip()
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
-SMTP_FROM = os.getenv("SMTP_FROM", "").strip() or SMTP_USER
 
+# --- SMTP / EMAIL CONFIGURATION ---
+SMTP_HOST = _get_secret("SMTP_HOST", "").strip()
+SMTP_PORT = int(_get_secret("SMTP_PORT", "587").strip() or 587)
+SMTP_USER = _get_secret("SMTP_USER", "").strip()
+SMTP_PASSWORD = _get_secret("SMTP_PASSWORD", "").strip()
+SMTP_FROM = _get_secret("SMTP_FROM", "").strip() or SMTP_USER
+
+
+# --- APPLICATION CONSTANTS ---
 LANGUAGES = [
-    "English", "Hindi", "Telugu", "Tamil", "Bengali", "Marathi", "Urdu",
-    "Spanish", "French", "German", "Portuguese", "Arabic", "Chinese",
-    "Japanese", "Indonesian", "Swahili",
+    "English",
+    "Hindi",
+    "Telugu",
+    "Tamil",
+    "Bengali",
+    "Marathi",
+    "Urdu",
+    "Spanish",
+    "French",
+    "German",
+    "Portuguese",
+    "Arabic",
+    "Chinese",
+    "Japanese",
+    "Indonesian",
+    "Swahili",
 ]
 LEVELS = ["Beginner", "Intermediate", "Advanced"]
 GOAL_TYPES = [
