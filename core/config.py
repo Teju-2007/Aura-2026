@@ -3,14 +3,15 @@
 Other files import from this file, so you change a value in ONE place only.
 """
 import os
-
+import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()  # reads the ".env" file (if it exists) into environment variables
+load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
-
+# Check .env first, then fallback to Streamlit Cloud Secrets
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL") or st.secrets.get("DATABASE_URL")
+GROQ_MODEL = os.getenv("GROQ_MODEL") or st.secrets.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 def _fix_db_url(url: str) -> str:
     """Hosting sites often give 'postgres://...'; SQLAlchemy wants a driver name."""
